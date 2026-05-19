@@ -2,14 +2,20 @@ package api
 
 import (
 	"bytes"
+	"encoding/json"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/bytedance/sonic"
 	"github.com/valyala/fasthttp"
 
 	"github.com/nrlacerda/fraud-detection-api/internal/config"
 	"github.com/nrlacerda/fraud-detection-api/internal/hnsw"
+	"github.com/nrlacerda/fraud-detection-api/internal/vectorize"
 )
 
 // buildTinyGraph creates an in-memory HNSW graph with N labeled nodes; every
@@ -31,6 +37,20 @@ func buildTinyGraph(tb testing.TB, N uint32, seed int64) *hnsw.Graph {
 	}
 	b.Finalize()
 	return b.G
+}
+
+func loadProductionGraphForBenchmark(b *testing.B) *hnsw.Graph {
+	b.Helper()
+
+	path := filepath.Join("..", "..", "resources", "hnsw.bin")
+	if _, err := os.Stat(path); err != nil {
+		b.Skipf("production index not available at %s: %v", path, err)
+	}
+	g, err := hnsw.LoadMmap(path)
+	if err != nil {
+		b.Fatalf("load production index: %v", err)
+	}
+	return g
 }
 
 // callHandler routes one request through h via an in-memory RequestCtx.
@@ -168,6 +188,74 @@ func TestHandler_FraudScore_BadJSONFallsBackToFraud(t *testing.T) {
 	}
 }
 
+func TestParseStrictRequest_MatchesSonicVectorization(t *testing.T) {
+	for name, payload := range map[string]string{
+		"with-last-transaction": samplePayload,
+		"null-last-transaction": samplePayloadNullLast,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var strictReq vectorize.Request
+			if err := parseStrictRequest([]byte(payload), &strictReq); err != nil {
+				t.Fatalf("parseStrictRequest: %v", err)
+			}
+
+			var sonicReq vectorize.Request
+			if err := sonic.Unmarshal([]byte(payload), &sonicReq); err != nil {
+				t.Fatalf("sonic.Unmarshal: %v", err)
+			}
+			sonicReq.HasLastTransaction = !sonicReq.LastTransaction.Timestamp.IsZero()
+
+			var strictVec, sonicVec [config.VectorDim]float32
+			vectorize.Vectorize(&strictReq, &strictVec)
+			vectorize.Vectorize(&sonicReq, &sonicVec)
+			if strictVec != sonicVec {
+				t.Fatalf("vector mismatch\nstrict=%v\nsonic =%v", strictVec, sonicVec)
+			}
+		})
+	}
+}
+
+func TestParseStrictRequest_ChallengeDatasetVectors(t *testing.T) {
+	if os.Getenv("FRAUD_VALIDATE_TEST_DATA") != "1" {
+		t.Skip("set FRAUD_VALIDATE_TEST_DATA=1 to validate strict parser against test/test-data.json")
+	}
+
+	path := filepath.Join("..", "..", "test", "test-data.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Skipf("test dataset not available at %s: %v", path, err)
+	}
+
+	var dataset struct {
+		Entries []struct {
+			Request json.RawMessage `json:"request"`
+		} `json:"entries"`
+	}
+	if err := sonic.Unmarshal(raw, &dataset); err != nil {
+		t.Fatalf("decode test-data.json: %v", err)
+	}
+
+	for i, entry := range dataset.Entries {
+		var strictReq vectorize.Request
+		if err := parseStrictRequest(entry.Request, &strictReq); err != nil {
+			t.Fatalf("entry %d strict parse: %v", i, err)
+		}
+
+		var sonicReq vectorize.Request
+		if err := sonic.Unmarshal(entry.Request, &sonicReq); err != nil {
+			t.Fatalf("entry %d sonic parse: %v", i, err)
+		}
+		sonicReq.HasLastTransaction = !sonicReq.LastTransaction.Timestamp.IsZero()
+
+		var strictVec, sonicVec [config.VectorDim]float32
+		vectorize.Vectorize(&strictReq, &strictVec)
+		vectorize.Vectorize(&sonicReq, &sonicVec)
+		if strictVec != sonicVec {
+			t.Fatalf("entry %d vector mismatch\nstrict=%v\nsonic =%v", i, strictVec, sonicVec)
+		}
+	}
+}
+
 // TestHandler_FraudScore_ResponseTableShape checks that the precomputed
 // response strings are exactly what we promise: 6 variants keyed by fraud
 // count, with approved flipping at count==3 (score 0.6).
@@ -220,4 +308,105 @@ func TestHandler_FraudScore_LowAllocOnHotPath(t *testing.T) {
 	if allocs > 30 {
 		t.Errorf("allocs/op = %.1f, expected <= 30 (vectorize+query path stayed pool-backed?)", allocs)
 	}
+}
+
+func BenchmarkHandlerFraudScoreProductionIndex(b *testing.B) {
+	g := loadProductionGraphForBenchmark(b)
+	h := NewHandler(g)
+	body := []byte(samplePayload)
+
+	// Warm the pool and mmap pages touched by this query shape.
+	for i := 0; i < 100; i++ {
+		var ctx fasthttp.RequestCtx
+		ctx.Request.SetRequestURI("/fraud-score")
+		ctx.Request.Header.SetMethod(fasthttp.MethodPost)
+		ctx.Request.SetBody(body)
+		h.Handle(&ctx)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var ctx fasthttp.RequestCtx
+		ctx.Request.SetRequestURI("/fraud-score")
+		ctx.Request.Header.SetMethod(fasthttp.MethodPost)
+		ctx.Request.SetBody(body)
+		h.Handle(&ctx)
+	}
+}
+
+func BenchmarkFraudScoreStagesProductionIndex(b *testing.B) {
+	g := loadProductionGraphForBenchmark(b)
+	body := []byte(samplePayload)
+	slot := hnsw.NewVisitSlot(g.N)
+
+	var req vectorize.Request
+	var vec [config.VectorDim]float32
+	var qvec [config.VectorDim]int16
+	var out [5]uint32
+	var ctx fasthttp.RequestCtx
+	ctx.Request.SetRequestURI("/fraud-score")
+	ctx.Request.Header.SetMethod(fasthttp.MethodPost)
+
+	var unmarshalDur, vectorizeDur, quantizeDur, queryDur, classifyDur, writeDur time.Duration
+
+	// Warm code paths and pages before timing.
+	for i := 0; i < 100; i++ {
+		req.Reset()
+		_ = parseStrictRequest(body, &req)
+		vectorize.Vectorize(&req, &vec)
+		hnsw.QuantizeQuery(&vec, &qvec)
+		g.QueryFast5(&qvec, slot, &out)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		req.Reset()
+
+		start := time.Now()
+		if err := parseStrictRequest(body, &req); err != nil {
+			b.Fatal(err)
+		}
+		unmarshalDur += time.Since(start)
+
+		start = time.Now()
+		vectorize.Vectorize(&req, &vec)
+		vectorizeDur += time.Since(start)
+
+		start = time.Now()
+		hnsw.QuantizeQuery(&vec, &qvec)
+		quantizeDur += time.Since(start)
+
+		start = time.Now()
+		g.QueryFast5(&qvec, slot, &out)
+		queryDur += time.Since(start)
+
+		start = time.Now()
+		fraudCount := 0
+		for _, id := range out {
+			if g.IsFraud(id) {
+				fraudCount++
+			}
+		}
+		classifyDur += time.Since(start)
+
+		start = time.Now()
+		ctx.Response.Reset()
+		writeJSON(&ctx, responseTable[fraudCount])
+		writeDur += time.Since(start)
+	}
+
+	b.StopTimer()
+	reportStageMetric(b, "unmarshal", unmarshalDur)
+	reportStageMetric(b, "vectorize", vectorizeDur)
+	reportStageMetric(b, "quantize", quantizeDur)
+	reportStageMetric(b, "query", queryDur)
+	reportStageMetric(b, "classify", classifyDur)
+	reportStageMetric(b, "write", writeDur)
+}
+
+func reportStageMetric(b *testing.B, name string, d time.Duration) {
+	b.Helper()
+	b.ReportMetric(float64(d.Nanoseconds())/float64(b.N), name+"_ns/op")
 }

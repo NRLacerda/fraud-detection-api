@@ -2,6 +2,8 @@ package hnsw
 
 import (
 	"math/rand"
+	"os"
+	"path/filepath"
 	"sort"
 	"testing"
 
@@ -31,6 +33,20 @@ func buildTestGraph(t testing.TB, N uint32, seed int64) *Graph {
 	}
 	b.Finalize()
 	return b.G
+}
+
+func loadProductionGraphForBenchmark(b *testing.B) *Graph {
+	b.Helper()
+
+	path := filepath.Join("..", "..", "resources", "hnsw.bin")
+	if _, err := os.Stat(path); err != nil {
+		b.Skipf("production index not available at %s: %v", path, err)
+	}
+	g, err := LoadMmap(path)
+	if err != nil {
+		b.Fatalf("load production index: %v", err)
+	}
+	return g
 }
 
 // bruteForceTop5 computes the exact 5 nearest node IDs to q by scanning all
@@ -201,6 +217,28 @@ func BenchmarkQueryFast5(b *testing.B) {
 		qVec[d] = int16(rng.Intn(256))
 	}
 	var out [5]uint32
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		g.QueryFast5(&qVec, slot, &out)
+	}
+}
+
+func BenchmarkQueryFast5ProductionIndex(b *testing.B) {
+	g := loadProductionGraphForBenchmark(b)
+	slot := NewVisitSlot(g.N)
+
+	var qVec [config.VectorDim]int16
+	for d := range config.VectorDim {
+		qVec[d] = int16((d + 1) * 17)
+	}
+	var out [5]uint32
+
+	// Warm the slot and the graph pages touched by this query.
+	for i := 0; i < 100; i++ {
+		g.QueryFast5(&qVec, slot, &out)
+	}
 
 	b.ReportAllocs()
 	b.ResetTimer()

@@ -14,7 +14,6 @@ package api
 import (
 	"sync"
 
-	"github.com/bytedance/sonic"
 	"github.com/valyala/fasthttp"
 
 	"github.com/nrlacerda/fraud-detection-api/internal/config"
@@ -112,13 +111,10 @@ func (h *Handler) handleScore(ctx *fasthttp.RequestCtx) {
 	w.req.Reset()
 
 	body := ctx.PostBody()
-	if err := sonic.Unmarshal(body, &w.req); err != nil {
+	if err := parseStrictRequest(body, &w.req); err != nil {
 		writeJSON(ctx, respFallback)
 		return
 	}
-	// LastTransaction was null in the source iff the timestamp parsed as zero.
-	// (Real payloads always carry a present-day ISO timestamp.)
-	w.req.HasLastTransaction = !w.req.LastTransaction.Timestamp.IsZero()
 
 	vectorize.Vectorize(&w.req, &w.vec)
 	hnsw.QuantizeQuery(&w.vec, &w.qvec)
