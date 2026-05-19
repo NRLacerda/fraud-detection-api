@@ -1,0 +1,2 @@
+# Keep the large k6 fixture out of GitHub language statistics.
+test/test-data.json linguist-generated=true
