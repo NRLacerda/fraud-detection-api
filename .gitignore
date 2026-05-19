@@ -17,6 +17,9 @@ resources/hnsw.bin
 # k6 local result artifact
 test/results.json
 
+# Local profiling output
+profiles/
+
 # IDE / OS
 .idea/
 .vscode/
