@@ -1,0 +1,25 @@
+# Reference dataset (3M vectors, ~285 MB) — pre-processed offline into hnsw.bin
+resources/references.json
+resources/references.json.gz
+
+# Build artifact baked into Docker image — too large for git
+resources/hnsw.bin
+/hnsw.bin
+
+# Go build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+.gocache/
+
+# k6 local result artifact
+test/results.json
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
