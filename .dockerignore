@@ -1,0 +1,9 @@
+.git
+.claude
+.gocache
+dist
+test/test-data.json
+test/results.json
+resources/references.json
+resources/references.json.gz
+hnsw.bin
