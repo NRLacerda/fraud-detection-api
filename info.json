@@ -1,0 +1,7 @@
+{
+    "participants": ["Nicolas Rocha Lacerda"],
+    "social": ["https://github.com/NRLacerda", "linkedin.com/in/nicolas-rocha-lacerda-b550491b8"],
+    "source-code-repo": "https://github.com/NRLacerda/fraud-detection-api",
+    "stack": ["go", "hnsw", "fasthttp", "nginx"],
+    "open_to_work": true
+}
